@@ -23,13 +23,20 @@ function notify {
         # Format string to escape special characters and send message through Telegram API.
         if [ -z "$DOMAIN" ]
         then
-            message=`echo -ne "*BugBountyScanner:* $1" | sed 's/[^a-zA-Z 0-9*_]/\\\\&/g'`
+            message=$(echo -ne "*BugBountyScanner:* $1" | sed 's/[^a-zA-Z 0-9*_]/\\\\&/g')
         else
-            message=`echo -ne "*BugBountyScanner [$DOMAIN]:* $1" | sed 's/[^a-zA-Z 0-9*_]/\\\\&/g'`
+            message=$(echo -ne "*BugBountyScanner [$DOMAIN]:* $1" | sed 's/[^a-zA-Z 0-9*_]/\\\\&/g')
         fi
-    
+
         curl -s -X POST "https://api.telegram.org/bot$telegram_api_key/sendMessage" -d chat_id="$telegram_chat_id" -d text="$message" -d parse_mode="MarkdownV2" &> /dev/null
         lastNotified=$(date +%s)
+    fi
+}
+
+function send_file {
+    if [ "$notify" = true ]
+    then
+        curl -s -X POST "https://api.telegram.org/bot$telegram_api_key/sendDocument" -F chat_id="$telegram_chat_id" -F document=@"$1" &> /dev/null
     fi
 }
 
@@ -109,7 +116,7 @@ then
     IFS=', ' read -r -a DOMAINS <<< "${domainargs[@]}"
 else
     read -r -p "[?] What's the target domain(s)? E.g. \"domain.com,domain2.com\". DOMAIN: " domainsresponse
-    IFS=', ' read -r -a DOMAINS <<< "$domainsresponse"  
+    IFS=', ' read -r -a DOMAINS <<< "$domainsresponse"
 fi
 
 if [ -z "$toolsDir" ]
@@ -122,7 +129,7 @@ echo "$PATH" | grep -q "$HOME/go/bin" || export PATH=$PATH:$HOME/go/bin
 
 if command -v nuclei &> /dev/null # Very crude dependency check :D
 then
-	echo "[*] Dependencies found."
+    echo "[*] Dependencies found."
 else
     echo "[*] Dependencies not found, running install script..."
     bash "$scriptDir/setup.sh" -t "$toolsDir"
@@ -232,7 +239,7 @@ do
             echo "[*] RUNNING NUCLEI..."
             notify "Detecting known vulnerabilities with Nuclei..."
             nuclei -c 150 -l "livedomains-$DOMAIN.txt" -severity low,medium,high,critical -etags "intrusive" -o "nuclei-$DOMAIN.txt"
-            
+
             if [ -f "nuclei-$DOMAIN.txt" ]
             then
                 highIssues="$(grep -c 'high' < "nuclei-$DOMAIN.txt")"
@@ -255,134 +262,133 @@ do
 
         if [ ! -d "ffuf" ] || [ "$overwrite" = true ]
         then
-                echo "[*] RUNNING FFUF..."
-		mkdir ffuf
-		cd ffuf || { echo "Something went wrong"; exit 1; }
+            echo "[*] RUNNING FFUF..."
+            mkdir ffuf
+            cd ffuf || { echo "Something went wrong"; exit 1; }
 
-		while read -r dname;
-		do
-    			filename=$(echo "${dname##*/}" | sed 's/:/./g')
-    			ffuf -w "$toolsDir/wordlists/tempfiles.txt" -u "$dname/FUZZ" -mc 200-299 -maxtime 180 -o "ffuf-$filename.csv" -of csv
-		done < "../livedomains-$DOMAIN.txt"
+            while read -r dname;
+            do
+                filename=$(echo "${dname##*/}" | sed 's/:/./g')
+                ffuf -w "$toolsDir/wordlists/tempfiles.txt" -u "$dname/FUZZ" -mc 200-299 -maxtime 180 -o "ffuf-$filename.csv" -of csv
+            done < "../livedomains-$DOMAIN.txt"
 
-        # Remove all files with only a header row
-        find . -type f -size -1c -delete
+            # Remove all files with only a header row
+            find . -type f -size -1c -delete
 
-        # Count the number of files (lines in the ffuf files, excluding the header row for each file) and sum into variable
-        ffufFiles=$(find . -type f -exec wc -l {} + | sed '$d' | awk '{sum+=$1-1} END{print sum}')
+            # Count the number of files (lines in the ffuf files, excluding the header row for each file) and sum into variable
+            ffufFiles=$(find . -type f -exec wc -l {} + | sed '$d' | awk '{sum+=$1-1} END{print sum}')
 
-		if [ "$ffufFiles" -gt 0 ]
-        then
-    			notify "FFUF completed. Got *$ffufFiles* files. Spidering paths with GoSpider..."
-    			cd .. || { echo "Something went wrong"; exit 1; }
-		else
-    			notify "FFUF completed. No temporary files identified. Spidering paths with GoSpider..."
-    			cd .. || { echo "Something went wrong"; exit 1; }
-    			rm -rf ffuf
-		fi
-
-            fi   
-        else
-            echo "[-] SKIPPING ffuf"
-        fi
-
-        if [ ! -f "paths-$DOMAIN.txt" ] || [ "$overwrite" = true ]
-        then
-            echo "[*] RUNNING GOSPIDER..."
-            # Spider for unique URLs, filter duplicate parameters
-            gospider -S "livedomains-$DOMAIN.txt" -o GoSpider -t 2 -c 4 -d 3 -m 3 --no-redirect --blacklist jpg,jpeg,gif,css,tif,tiff,png,ttf,woff,woff2,ico,svg
-            cat GoSpider/* | grep -o -E "(([a-zA-Z][a-zA-Z0-9+-.]*\:\/\/)|mailto|data\:)([a-zA-Z0-9\.\&\/\?\:@\+-\_=#%;,])*" | sort -u | qsreplace -a | grep "$DOMAIN" > "tmp-GoSpider-$DOMAIN.txt"
-            rm -rf GoSpider
-            notify "GoSpider completed. Crawled *$(wc -l < "tmp-GoSpider-$DOMAIN.txt")* endpoints. Getting interesting endpoints and parameters..."
-
-            ## Enrich GoSpider list with parameters from GAU/WayBack. Disregard new GAU endpoints to prevent clogging with unreachable endpoints (See Issue #24).
-            # Get only endpoints from GoSpider list (assumed to be live), disregard parameters, and append ? for grepping
-            sed "s/\?.*//" "tmp-GoSpider-$DOMAIN.txt" | sort -u | sed -e 's/$/\?/' > "tmp-LivePathsQuery-$DOMAIN.txt"
-            # Find common endpoints containing (hopefully new and interesting) parameters from GAU/Wayback list
-            grep -f "tmp-LivePathsQuery-$DOMAIN.txt" "WayBack-$DOMAIN.txt" > "tmp-LiveWayBack-$DOMAIN.txt"
-            # Merge new parameters with GoSpider list and get only unique endpoints
-            cat "tmp-LiveWayBack-$DOMAIN.txt" "tmp-GoSpider-$DOMAIN.txt" | sort -u | qsreplace -a > "paths-$DOMAIN.txt"
-            rm "tmp-LivePathsQuery-$DOMAIN.txt" "tmp-LiveWayBack-$DOMAIN.txt" "tmp-GoSpider-$DOMAIN.txt"
-        else
-            echo "[-] SKIPPING GOSPIDER"
-        fi
-
-        if [ ! -d "check-manually" ] || [ "$overwrite" = true ]
-        then
-            echo "[*] GETTING INTERESTING PARAMETERS WITH GF..."
-            mkdir "check-manually"
-            # Use GF to identify "suspicious" endpoints that may be vulnerable (automatic checks below)
-            gf ssrf < "paths-$DOMAIN.txt" > "check-manually/server-side-request-forgery.txt"
-            gf xss < "paths-$DOMAIN.txt" > "check-manually/cross-site-scripting.txt"
-            gf redirect < "paths-$DOMAIN.txt" > "check-manually/open-redirect.txt"
-            gf rce < "paths-$DOMAIN.txt" > "check-manually/rce.txt"
-            gf idor < "paths-$DOMAIN.txt" > "check-manually/insecure-direct-object-reference.txt"
-            gf sqli < "paths-$DOMAIN.txt" > "check-manually/sql-injection.txt"
-            gf lfi < "paths-$DOMAIN.txt" > "check-manually/local-file-inclusion.txt"
-            gf ssti < "paths-$DOMAIN.txt" > "check-manually/server-side-template-injection.txt"
-            notify "Done! Gathered a total of *$(wc -l < "paths-$DOMAIN.txt")* paths, of which *$(cat check-manually/* | wc -l)* possibly exploitable. Testing for Server-Side Template Injection..."
-        else
-            echo "[-] SKIPPING GF"
-        fi
-
-        if [ ! -f "potential-ssti.txt" ] || [ "$overwrite" = true ]
-        then
-            echo "[*] TESTING FOR SSTI..."
-            qsreplace "BugBountyScanner{{9*9}}" < "check-manually/server-side-template-injection.txt" | \
-            xargs -I % -P 100 sh -c 'curl -s "%" 2>&1 | grep -q "BugBountyScanner81" && echo "[+] Found endpoint likely to be vulnerable to SSTI: %" && echo "%" >> potential-ssti.txt'
-            if [ -f "potential-ssti.txt" ]; then
-                notify "Identified *$(wc -l < potential-ssti.txt)* endpoints potentially vulnerable to SSTI! Testing for Local File Inclusion..."
+            if [ "$ffufFiles" -gt 0 ]
+            then
+                notify "FFUF completed. Got *$ffufFiles* files. Spidering paths with GoSpider..."
+                cd .. || { echo "Something went wrong"; exit 1; }
             else
-                notify "No SSTI found. Testing for Local File Inclusion..."
+                notify "FFUF completed. No temporary files identified. Spidering paths with GoSpider..."
+                cd .. || { echo "Something went wrong"; exit 1; }
+                rm -rf ffuf
             fi
-        else
-            echo "[-] SKIPPING TEST FOR SSTI"
-        fi
 
-        if [ ! -f "potential-lfi.txt" ] || [ "$overwrite" = true ]
-        then
-            echo "[*] TESTING FOR (*NIX) LFI..."
-            qsreplace "/etc/passwd" < "check-manually/local-file-inclusion.txt" | \
-            xargs -I % -P 100 sh -c 'curl -s "%" 2>&1 | grep -q "root:x:" && echo "[+] Found endpoint likely to be vulnerable to LFI: %" && echo "%" >> potential-lfi.txt'
-            if [ -f "potential-lfi.txt" ]; then
-                notify "Identified *$(wc -l < potential-lfi.txt)* endpoints potentially vulnerable to LFI! Testing for Open Redirections..."
-            else
-                notify "No LFI found. Testing for Open Redirections..."
-            fi
-        else
-            echo "[-] SKIPPING TEST FOR (*NIX) LFI"
         fi
+    else
+        echo "[-] SKIPPING ffuf"
+    fi
 
-        if [ ! -f "potential-or.txt" ] || [ "$overwrite" = true ]
-        then
-            echo "[*] TESTING FOR OPEN REDIRECTS..."
-            qsreplace "https://www.testing123.com" < "check-manually/open-redirect.txt" | \
-            xargs -I % -P 100 sh -c 'curl -s "%" 2>&1 | grep -q "Location: https://www.testing123.com" && echo "[+] Found endpoint likely to be vulnerable to OR: %" && echo "%" >> potential-or.txt'
-            if [ -f "potential-or.txt" ]; then
-                notify "Identified *$(wc -l < potential-or.txt)* endpoints potentially vulnerable to open redirects! Resolving IP Addresses..."
-            else
-                notify "No open redirects found. Starting Nmap for *$(wc -l < "ip-addresses-$DOMAIN.txt")* IP addresses..."
-            fi
+    if [ ! -f "paths-$DOMAIN.txt" ] || [ "$overwrite" = true ]
+    then
+        echo "[*] RUNNING GOSPIDER..."
+        # Spider for unique URLs, filter duplicate parameters
+        gospider -S "livedomains-$DOMAIN.txt" -o GoSpider -t 2 -c 4 -d 3 -m 3 --no-redirect --blacklist jpg,jpeg,gif,css,tif,tiff,png,ttf,woff,woff2,ico,svg
+        cat GoSpider/* | grep -o -E "(([a-zA-Z][a-zA-Z0-9+-.]*\:\/\/)|mailto|data\:)([a-zA-Z0-9\.\&\/\?\:@\+-\_=#%;,])*" | sort -u | qsreplace -a | grep "$DOMAIN" > "tmp-GoSpider-$DOMAIN.txt"
+        rm -rf GoSpider
+        notify "GoSpider completed. Crawled *$(wc -l < "tmp-GoSpider-$DOMAIN.txt")* endpoints. Getting interesting endpoints and parameters..."
+
+        ## Enrich GoSpider list with parameters from GAU/WayBack. Disregard new GAU endpoints to prevent clogging with unreachable endpoints (See Issue #24).
+        # Get only endpoints from GoSpider list (assumed to be live), disregard parameters, and append ? for grepping
+        sed "s/\?.*//" "tmp-GoSpider-$DOMAIN.txt" | sort -u | sed -e 's/$/\?/' > "tmp-LivePathsQuery-$DOMAIN.txt"
+        # Find common endpoints containing (hopefully new and interesting) parameters from GAU/Wayback list
+        grep -f "tmp-LivePathsQuery-$DOMAIN.txt" "WayBack-$DOMAIN.txt" > "tmp-LiveWayBack-$DOMAIN.txt"
+        # Merge new parameters with GoSpider list and get only unique endpoints
+        cat "tmp-LiveWayBack-$DOMAIN.txt" "tmp-GoSpider-$DOMAIN.txt" | sort -u | qsreplace -a > "paths-$DOMAIN.txt"
+        rm "tmp-LivePathsQuery-$DOMAIN.txt" "tmp-LiveWayBack-$DOMAIN.txt" "tmp-GoSpider-$DOMAIN.txt"
+    else
+        echo "[-] SKIPPING GOSPIDER"
+    fi
+
+    if [ ! -d "check-manually" ] || [ "$overwrite" = true ]
+    then
+        echo "[*] GETTING INTERESTING PARAMETERS WITH GF..."
+        mkdir "check-manually"
+        # Use GF to identify "suspicious" endpoints that may be vulnerable (automatic checks below)
+        gf ssrf < "paths-$DOMAIN.txt" > "check-manually/server-side-request-forgery.txt"
+        gf xss < "paths-$DOMAIN.txt" > "check-manually/cross-site-scripting.txt"
+        gf redirect < "paths-$DOMAIN.txt" > "check-manually/open-redirect.txt"
+        gf rce < "paths-$DOMAIN.txt" > "check-manually/rce.txt"
+        gf idor < "paths-$DOMAIN.txt" > "check-manually/insecure-direct-object-reference.txt"
+        gf sqli < "paths-$DOMAIN.txt" > "check-manually/sql-injection.txt"
+        gf lfi < "paths-$DOMAIN.txt" > "check-manually/local-file-inclusion.txt"
+        gf ssti < "paths-$DOMAIN.txt" > "check-manually/server-side-template-injection.txt"
+        notify "Done! Gathered a total of *$(wc -l < "paths-$DOMAIN.txt")* paths, of which *$(cat check-manually/* | wc -l)* possibly exploitable. Testing for Server-Side Template Injection..."
+    else
+        echo "[-] SKIPPING GF"
+    fi
+
+    if [ ! -f "potential-ssti.txt" ] || [ "$overwrite" = true ]
+    then
+        echo "[*] TESTING FOR SSTI..."
+        qsreplace "BugBountyScanner{{9*9}}" < "check-manually/server-side-template-injection.txt" | \
+        xargs -I % -P 100 sh -c 'curl -s "%" 2>&1 | grep -q "BugBountyScanner81" && echo "[+] Found endpoint likely to be vulnerable to SSTI: %" && echo "%" >> potential-ssti.txt'
+        if [ -f "potential-ssti.txt" ]; then
+            notify "Identified *$(wc -l < potential-ssti.txt)* endpoints potentially vulnerable to SSTI! Testing for Local File Inclusion..."
         else
-            echo "[-] SKIPPING TEST FOR OPEN REDIRECTS"
+            notify "No SSTI found. Testing for Local File Inclusion..."
         fi
+    else
+        echo "[-] SKIPPING TEST FOR SSTI"
+    fi
 
-        if [ ! -d "nmap" ] || [ "$overwrite" = true ]
-        then
-            echo "[*] RUNNING NMAP (TOP 1000 TCP)..."
-            mkdir nmap
-            nmap -T4 -sV --open --source-port 53 --max-retries 3 --host-timeout 15m -iL "ip-addresses-$DOMAIN.txt" -oA nmap/nmap-tcp
-            grep Port < nmap/nmap-tcp.gnmap | cut -d' ' -f2 | sort -u > nmap/tcpips.txt
-            notify "Nmap TCP done! Identified *$(grep -c "Port" < "nmap/nmap-tcp.gnmap")* IPs with ports open. Starting Nmap UDP/SNMP scan for *$(wc -l < "nmap/tcpips.txt")* IP addresses..."
-
-            echo "[*] RUNNING NMAP (SNMP UDP)..."
-            nmap -T4 -sU -sV -p 161 --open --source-port 53 -iL nmap/tcpips.txt -oA nmap/nmap-161udp
-            rm nmap/tcpips.txt
-            notify "Nmap UDP done! Identified *$(grep "Port" < "nmap/nmap-161udp.gnmap" | grep -cv "filtered")* IPS with SNMP port open."
+    if [ ! -f "potential-lfi.txt" ] || [ "$overwrite" = true ]
+    then
+        echo "[*] TESTING FOR (*NIX) LFI..."
+        qsreplace "/etc/passwd" < "check-manually/local-file-inclusion.txt" | \
+        xargs -I % -P 100 sh -c 'curl -s "%" 2>&1 | grep -q "root:x:" && echo "[+] Found endpoint likely to be vulnerable to LFI: %" && echo "%" >> potential-lfi.txt'
+        if [ -f "potential-lfi.txt" ]; then
+            notify "Identified *$(wc -l < potential-lfi.txt)* endpoints potentially vulnerable to LFI! Testing for Open Redirections..."
         else
-            echo "[-] SKIPPING NMAP"
+            notify "No LFI found. Testing for Open Redirections..."
         fi
-    
+    else
+        echo "[-] SKIPPING TEST FOR (*NIX) LFI"
+    fi
+
+    if [ ! -f "potential-or.txt" ] || [ "$overwrite" = true ]
+    then
+        echo "[*] TESTING FOR OPEN REDIRECTS..."
+        qsreplace "https://www.testing123.com" < "check-manually/open-redirect.txt" | \
+        xargs -I % -P 100 sh -c 'curl -s "%" 2>&1 | grep -q "Location: https://www.testing123.com" && echo "[+] Found endpoint likely to be vulnerable to OR: %" && echo "%" >> potential-or.txt'
+        if [ -f "potential-or.txt" ]; then
+            notify "Identified *$(wc -l < potential-or.txt)* endpoints potentially vulnerable to open redirects! Resolving IP Addresses..."
+        else
+            notify "No open redirects found. Starting Nmap for *$(wc -l < "ip-addresses-$DOMAIN.txt")* IP addresses..."
+        fi
+    else
+        echo "[-] SKIPPING TEST FOR OPEN REDIRECTS"
+    fi
+
+    if [ ! -d "nmap" ] || [ "$overwrite" = true ]
+    then
+        echo "[*] RUNNING NMAP (TOP 1000 TCP)..."
+        mkdir nmap
+        nmap -T4 -sV --open --source-port 53 --max-retries 3 --host-timeout 15m -iL "ip-addresses-$DOMAIN.txt" -oA nmap/nmap-tcp
+        grep Port < nmap/nmap-tcp.gnmap | cut -d' ' -f2 | sort -u > nmap/tcpips.txt
+        notify "Nmap TCP done! Identified *$(grep -c "Port" < "nmap/nmap-tcp.gnmap")* IPs with ports open. Starting Nmap UDP/SNMP scan for *$(wc -l < "nmap/tcpips.txt")* IP addresses..."
+
+        echo "[*] RUNNING NMAP (SNMP UDP)..."
+        nmap -T4 -sU -sV -p 161 --open --source-port 53 -iL nmap/tcpips.txt -oA nmap/nmap-161udp
+        rm nmap/tcpips.txt
+        notify "Nmap UDP done! Identified *$(grep "Port" < "nmap/nmap-161udp.gnmap" | grep -cv "filtered")* IPS with SNMP port open."
+    else
+        echo "[-] SKIPPING NMAP"
+    fi
 
     cd ..
     echo "[+] DONE SCANNING $DOMAIN."
@@ -392,3 +398,4 @@ done
 
 echo "[+] DONE! :D"
 notify "Recon finished! Go hack em!"
+send_file "$LOG_FILE"
